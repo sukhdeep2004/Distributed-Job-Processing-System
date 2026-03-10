@@ -10,6 +10,16 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
 
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("Dashboard", policy =>
+    {
+        policy.WithOrigins("http://localhost:3000")
+              .AllowAnyHeader()
+              .AllowAnyMethod();
+    });
+});
+
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
 {
     var redisConnectionString =
@@ -41,6 +51,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
+app.UseCors("Dashboard");
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
     .WithName("Health")
@@ -123,6 +134,23 @@ app.MapGet("/jobs/{jobId}", async (string jobId, JobDbContext dbContext) =>
     return Results.Ok(job);
 })
 .WithName("GetJobStatus")
+.WithOpenApi();
+
+app.MapGet("/jobs", async (int page, int pageSize, JobDbContext dbContext) =>
+{
+    var safePage = page <= 0 ? 1 : page;
+    var safePageSize = pageSize <= 0 || pageSize > 100 ? 50 : pageSize;
+
+    var query = dbContext.Jobs
+        .OrderByDescending(j => j.CreatedAt)
+        .Skip((safePage - 1) * safePageSize)
+        .Take(safePageSize);
+
+    var jobs = await query.ToListAsync();
+
+    return Results.Ok(jobs);
+})
+.WithName("ListJobs")
 .WithOpenApi();
 
 app.Run();
