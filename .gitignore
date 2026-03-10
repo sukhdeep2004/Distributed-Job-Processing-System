@@ -9,6 +9,9 @@ env/
 # Build / IDE
 dist/
 build/
+.vs/
+**/bin/
+**/obj/
 .idea/
 .vscode/
 *.log

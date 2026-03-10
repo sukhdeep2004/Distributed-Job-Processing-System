@@ -1,0 +1,6 @@
+@DistributedJobSystem.Api_HostAddress = http://localhost:5083
+
+GET {{DistributedJobSystem.Api_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

@@ -1,0 +1,22 @@
+.git
+.gitignore
+**/.vs
+**/.vscode
+**/*.user
+**/*.suo
+**/*.cache
+
+# build outputs
+**/bin
+**/obj
+
+# node/python
+**/node_modules
+**/__pycache__
+**/*.pyc
+**/.venv
+**/venv
+
+# misc
+**/*.log
+**/.env

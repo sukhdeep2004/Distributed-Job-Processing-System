@@ -1,0 +1,42 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: djs
+      POSTGRES_PASSWORD: djs
+      POSTGRES_DB: djs
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: .
+      dockerfile: api/DistributedJobSystem.Api/Dockerfile
+    environment:
+      ASPNETCORE_URLS: http://+:8080
+      Redis__ConnectionString: redis:6379
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+      - postgres
+
+  worker:
+    build:
+      context: .
+      dockerfile: worker/DistributedJobSystem.Worker/Dockerfile
+    environment:
+      Redis__ConnectionString: redis:6379
+    depends_on:
+      - redis
+      - postgres
+
+volumes:
+  postgres_data:
