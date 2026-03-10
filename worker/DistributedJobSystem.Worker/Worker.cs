@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Npgsql;
 using StackExchange.Redis;
 
 namespace DistributedJobSystem.Worker;
@@ -7,11 +8,15 @@ public class Worker : BackgroundService
 {
     private readonly ILogger<Worker> _logger;
     private readonly IConnectionMultiplexer _mux;
+    private readonly string _pgConnectionString;
 
-    public Worker(ILogger<Worker> logger, IConnectionMultiplexer mux)
+    public Worker(ILogger<Worker> logger, IConnectionMultiplexer mux, IConfiguration configuration)
     {
         _logger = logger;
         _mux = mux;
+        _pgConnectionString =
+            configuration.GetSection("Postgres")["ConnectionString"]
+            ?? "Host=postgres;Port=5432;Database=djs;Username=djs;Password=djs";
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -21,7 +26,6 @@ public class Worker : BackgroundService
 
         while (!stoppingToken.IsCancellationRequested)
         {
-            // BRPOP blocks until a job arrives (or timeout so we can observe cancellation)
             RedisValue jobJson;
             try
             {
@@ -56,12 +60,30 @@ public class Worker : BackgroundService
                 continue;
 
             await SetStatusAsync(db, job.Id, JobStatus.RUNNING, stoppingToken);
+            await UpdateJobRowAsync(
+                job.Id,
+                JobStatus.RUNNING,
+                startedAt: DateTimeOffset.UtcNow,
+                finishedAt: null,
+                retryCount: job.Retry,
+                result: null,
+                error: null,
+                ct: stoppingToken);
 
             try
             {
                 var result = await ExecuteJobAsync(job, stoppingToken);
                 await db.StringSetAsync(RedisKeys.JobResult(job.Id), result);
                 await SetStatusAsync(db, job.Id, JobStatus.COMPLETED, stoppingToken);
+                await UpdateJobRowAsync(
+                    job.Id,
+                    JobStatus.COMPLETED,
+                    startedAt: null,
+                    finishedAt: DateTimeOffset.UtcNow,
+                    retryCount: job.Retry,
+                    result: result,
+                    error: null,
+                    ct: stoppingToken);
             }
             catch (Exception ex)
             {
@@ -73,6 +95,15 @@ public class Worker : BackgroundService
                 if (nextRetry <= job.MaxRetry)
                 {
                     await SetStatusAsync(db, job.Id, JobStatus.RETRYING, stoppingToken);
+                    await UpdateJobRowAsync(
+                        job.Id,
+                        JobStatus.RETRYING,
+                        startedAt: null,
+                        finishedAt: null,
+                        retryCount: nextRetry,
+                        result: null,
+                        error: ex.Message,
+                        ct: stoppingToken);
 
                     var delaySeconds = Math.Pow(2, nextRetry);
                     await Task.Delay(TimeSpan.FromSeconds(delaySeconds), stoppingToken);
@@ -84,6 +115,15 @@ public class Worker : BackgroundService
                 else
                 {
                     await SetStatusAsync(db, job.Id, JobStatus.FAILED, stoppingToken);
+                    await UpdateJobRowAsync(
+                        job.Id,
+                        JobStatus.FAILED,
+                        startedAt: null,
+                        finishedAt: DateTimeOffset.UtcNow,
+                        retryCount: nextRetry,
+                        result: null,
+                        error: ex.Message,
+                        ct: stoppingToken);
                     await db.ListLeftPushAsync(RedisQueues.DeadLetterQueue, jobJson);
                 }
             }
@@ -95,12 +135,10 @@ public class Worker : BackgroundService
         switch (job.Type)
         {
             case "send_email":
-                // Simulated email send
                 await Task.Delay(TimeSpan.FromSeconds(1), ct);
                 return $"Email sent at {DateTimeOffset.UtcNow:O}";
 
             case "image_processing":
-                // Simulated image processing
                 await Task.Delay(TimeSpan.FromSeconds(2), ct);
                 return $"Image processed at {DateTimeOffset.UtcNow:O}";
 
@@ -113,6 +151,49 @@ public class Worker : BackgroundService
     {
         await db.StringSetAsync(RedisKeys.JobStatus(jobId), status.ToString());
         await db.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    }
+
+    private async Task UpdateJobRowAsync(
+        string jobId,
+        JobStatus status,
+        DateTimeOffset? startedAt = null,
+        DateTimeOffset? finishedAt = null,
+        int? retryCount = null,
+        string? result = null,
+        string? error = null,
+        CancellationToken ct = default)
+    {
+        try
+        {
+            await using var conn = new NpgsqlConnection(_pgConnectionString);
+            await conn.OpenAsync(ct);
+
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = """
+                update jobs
+                set status = @status,
+                    started_at = coalesce(@started_at, started_at),
+                    finished_at = coalesce(@finished_at, finished_at),
+                    retry_count = coalesce(@retry_count, retry_count),
+                    result = coalesce(@result, result),
+                    error_message = coalesce(@error, error_message)
+                where id = @id
+                """;
+
+            cmd.Parameters.AddWithValue("@status", status.ToString());
+            cmd.Parameters.AddWithValue("@id", jobId);
+            cmd.Parameters.AddWithValue("@started_at", (object?)startedAt ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@finished_at", (object?)finishedAt ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@retry_count", (object?)retryCount ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@result", (object?)result ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("@error", (object?)error ?? DBNull.Value);
+
+            await cmd.ExecuteNonQueryAsync(ct);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to update job row for {jobId}", jobId);
+        }
     }
 }
 

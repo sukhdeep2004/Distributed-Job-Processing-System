@@ -1,5 +1,7 @@
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using StackExchange.Redis;
+using DistributedJobSystem.Api;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -15,7 +17,21 @@ builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
     return ConnectionMultiplexer.Connect(redisConnectionString);
 });
 
+builder.Services.AddDbContext<JobDbContext>(options =>
+{
+    var connStr = builder.Configuration.GetConnectionString("JobsDatabase")
+                  ?? "Host=postgres;Port=5432;Database=djs;Username=djs;Password=djs";
+    options.UseNpgsql(connStr);
+});
+
 var app = builder.Build();
+
+// Ensure database exists
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<JobDbContext>();
+    db.Database.EnsureCreated();
+}
 
 // Configure the HTTP request pipeline.
 if (app.Environment.IsDevelopment())
@@ -30,67 +46,81 @@ app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
     .WithName("Health")
     .WithOpenApi();
 
-app.MapPost("/jobs/send-email", async (SendEmailRequest req, IConnectionMultiplexer mux) =>
+app.MapPost("/jobs/send-email", async (SendEmailRequest req, IConnectionMultiplexer mux, JobDbContext dbContext) =>
 {
     var jobId = $"job_{Guid.NewGuid():N}";
+    var createdAt = DateTimeOffset.UtcNow;
+
     var job = new JobMessage(
         Id: jobId,
         Type: "send_email",
         Payload: JsonSerializer.SerializeToElement(req),
         Retry: 0,
         MaxRetry: 5,
-        CreatedAt: DateTimeOffset.UtcNow);
+        CreatedAt: createdAt);
 
-    var db = mux.GetDatabase();
-    await db.ListLeftPushAsync(RedisQueues.DefaultQueue, JsonSerializer.Serialize(job));
-    await db.StringSetAsync(RedisKeys.JobStatus(jobId), JobStatus.PENDING.ToString());
-    await db.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    var redis = mux.GetDatabase();
+    await redis.ListLeftPushAsync(RedisQueues.DefaultQueue, JsonSerializer.Serialize(job));
+    await redis.StringSetAsync(RedisKeys.JobStatus(jobId), JobStatus.PENDING.ToString());
+    await redis.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+    dbContext.Jobs.Add(new Job
+    {
+        Id = jobId,
+        Type = job.Type,
+        Status = JobStatus.PENDING.ToString(),
+        CreatedAt = createdAt,
+        RetryCount = 0
+    });
+    await dbContext.SaveChangesAsync();
 
     return Results.Accepted($"/jobs/{jobId}", new { id = jobId });
 })
 .WithName("EnqueueSendEmail")
 .WithOpenApi();
 
-app.MapPost("/jobs/image-processing", async (ImageProcessingRequest req, IConnectionMultiplexer mux) =>
+app.MapPost("/jobs/image-processing", async (ImageProcessingRequest req, IConnectionMultiplexer mux, JobDbContext dbContext) =>
 {
     var jobId = $"job_{Guid.NewGuid():N}";
+    var createdAt = DateTimeOffset.UtcNow;
+
     var job = new JobMessage(
         Id: jobId,
         Type: "image_processing",
         Payload: JsonSerializer.SerializeToElement(req),
         Retry: 0,
         MaxRetry: 5,
-        CreatedAt: DateTimeOffset.UtcNow);
+        CreatedAt: createdAt);
 
-    var db = mux.GetDatabase();
-    await db.ListLeftPushAsync(RedisQueues.DefaultQueue, JsonSerializer.Serialize(job));
-    await db.StringSetAsync(RedisKeys.JobStatus(jobId), JobStatus.PENDING.ToString());
-    await db.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+    var redis = mux.GetDatabase();
+    await redis.ListLeftPushAsync(RedisQueues.DefaultQueue, JsonSerializer.Serialize(job));
+    await redis.StringSetAsync(RedisKeys.JobStatus(jobId), JobStatus.PENDING.ToString());
+    await redis.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+    dbContext.Jobs.Add(new Job
+    {
+        Id = jobId,
+        Type = job.Type,
+        Status = JobStatus.PENDING.ToString(),
+        CreatedAt = createdAt,
+        RetryCount = 0
+    });
+    await dbContext.SaveChangesAsync();
 
     return Results.Accepted($"/jobs/{jobId}", new { id = jobId });
 })
 .WithName("EnqueueImageProcessing")
 .WithOpenApi();
 
-app.MapGet("/jobs/{jobId}", async (string jobId, IConnectionMultiplexer mux) =>
+app.MapGet("/jobs/{jobId}", async (string jobId, JobDbContext dbContext) =>
 {
-    var db = mux.GetDatabase();
-    var status = await db.StringGetAsync(RedisKeys.JobStatus(jobId));
-    if (status.IsNullOrEmpty)
-        return Results.NotFound(new { id = jobId });
-
-    var updatedAt = await db.StringGetAsync(RedisKeys.JobUpdatedAt(jobId));
-    var result = await db.StringGetAsync(RedisKeys.JobResult(jobId));
-    var error = await db.StringGetAsync(RedisKeys.JobError(jobId));
-
-    return Results.Ok(new
+    var job = await dbContext.Jobs.FindAsync(jobId);
+    if (job is null)
     {
-        id = jobId,
-        status = status.ToString(),
-        updatedAtUnixSeconds = updatedAt.IsNullOrEmpty ? null : (long?)updatedAt,
-        result = result.IsNullOrEmpty ? null : result.ToString(),
-        error = error.IsNullOrEmpty ? null : error.ToString()
-    });
+        return Results.NotFound(new { id = jobId });
+    }
+
+    return Results.Ok(job);
 })
 .WithName("GetJobStatus")
 .WithOpenApi();
