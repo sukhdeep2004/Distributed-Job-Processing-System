@@ -1,7 +1,14 @@
 using DistributedJobSystem.Worker;
+using Serilog;
 using StackExchange.Redis;
 
 var builder = Host.CreateApplicationBuilder(args);
+
+builder.Logging.ClearProviders();
+Log.Logger = new LoggerConfiguration()
+    .ReadFrom.Configuration(builder.Configuration)
+    .CreateLogger();
+builder.Services.AddSerilog();
 
 builder.Services.AddSingleton<IConnectionMultiplexer>(_ =>
 {

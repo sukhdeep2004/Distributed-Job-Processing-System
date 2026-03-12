@@ -88,3 +88,21 @@ The dashboard shows:
 - **Retry** button for failed jobs (re-queues the job)
 
 It auto‑refreshes every few seconds and can also be refreshed manually with the **Refresh** button.
+
+## 4. Logging + metrics (Part 5)
+
+### Serilog structured logging
+
+- API and Worker use **Serilog** and write structured logs to stdout (great for Docker).
+
+### Prometheus metrics
+
+- API exposes Prometheus metrics at:
+  - `http://localhost:8080/metrics`
+- Prometheus runs at:
+  - `http://localhost:9090`
+
+Example metrics to query in Prometheus:
+
+- `jobs_enqueued_total`
+- `jobs_retry_requested_total`

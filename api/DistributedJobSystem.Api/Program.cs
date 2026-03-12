@@ -1,9 +1,17 @@
 using System.Text.Json;
+using System.Diagnostics.Metrics;
 using Microsoft.EntityFrameworkCore;
+using OpenTelemetry.Metrics;
+using OpenTelemetry.Resources;
+using OpenTelemetry;
+using Serilog;
 using StackExchange.Redis;
 using DistributedJobSystem.Api;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Host.UseSerilog((ctx, services, cfg) =>
+    cfg.ReadFrom.Configuration(ctx.Configuration));
 
 // Add services to the container.
 // Learn more about configuring Swagger/OpenAPI at https://aka.ms/aspnetcore/swashbuckle
@@ -34,6 +42,20 @@ builder.Services.AddDbContext<JobDbContext>(options =>
     options.UseNpgsql(connStr);
 });
 
+var meter = new Meter("DistributedJobSystem.Api", "1.0.0");
+var jobsEnqueued = meter.CreateCounter<long>("jobs_enqueued_total");
+var jobRetriesRequested = meter.CreateCounter<long>("jobs_retry_requested_total");
+
+builder.Services.AddOpenTelemetry()
+    .WithMetrics(metrics =>
+    {
+        metrics
+            .SetResourceBuilder(ResourceBuilder.CreateDefault().AddService("distributed-job-api"))
+            .AddAspNetCoreInstrumentation()
+            .AddMeter("DistributedJobSystem.Api")
+            .AddPrometheusExporter();
+    });
+
 var app = builder.Build();
 
 // Ensure database exists and add payload_json if missing (for existing DBs)
@@ -53,6 +75,10 @@ if (app.Environment.IsDevelopment())
 
 app.UseHttpsRedirection();
 app.UseCors("Dashboard");
+
+app.UseSerilogRequestLogging();
+
+app.MapPrometheusScrapingEndpoint("/metrics");
 
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
     .WithName("Health")
@@ -89,6 +115,8 @@ app.MapPost("/jobs/send-email", async (SendEmailRequest req, string? priority, I
     });
     await dbContext.SaveChangesAsync();
 
+    jobsEnqueued.Add(1, new KeyValuePair<string, object?>("type", job.Type), new KeyValuePair<string, object?>("priority", priority ?? "default"));
+
     return Results.Accepted($"/jobs/{jobId}", new { id = jobId });
 })
 .WithName("EnqueueSendEmail")
@@ -124,6 +152,8 @@ app.MapPost("/jobs/image-processing", async (ImageProcessingRequest req, string?
         PayloadJson = payloadJson
     });
     await dbContext.SaveChangesAsync();
+
+    jobsEnqueued.Add(1, new KeyValuePair<string, object?>("type", job.Type), new KeyValuePair<string, object?>("priority", priority ?? "default"));
 
     return Results.Accepted($"/jobs/{jobId}", new { id = jobId });
 })
@@ -194,6 +224,8 @@ app.MapPost("/jobs/{jobId}/retry", async (string jobId, IConnectionMultiplexer m
     job.StartedAt = null;
     job.FinishedAt = null;
     await dbContext.SaveChangesAsync();
+
+    jobRetriesRequested.Add(1, new KeyValuePair<string, object?>("type", job.Type));
 
     return Results.Accepted($"/jobs/{jobId}", new { id = jobId });
 })
