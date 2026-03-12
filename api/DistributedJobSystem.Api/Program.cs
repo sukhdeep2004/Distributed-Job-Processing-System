@@ -36,11 +36,12 @@ builder.Services.AddDbContext<JobDbContext>(options =>
 
 var app = builder.Build();
 
-// Ensure database exists
+// Ensure database exists and add payload_json if missing (for existing DBs)
 using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<JobDbContext>();
     db.Database.EnsureCreated();
+    _ = db.Database.ExecuteSqlRawAsync("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS payload_json TEXT").GetAwaiter().GetResult();
 }
 
 // Configure the HTTP request pipeline.
@@ -57,10 +58,11 @@ app.MapGet("/health", () => Results.Ok(new { status = "ok" }))
     .WithName("Health")
     .WithOpenApi();
 
-app.MapPost("/jobs/send-email", async (SendEmailRequest req, IConnectionMultiplexer mux, JobDbContext dbContext) =>
+app.MapPost("/jobs/send-email", async (SendEmailRequest req, string? priority, IConnectionMultiplexer mux, JobDbContext dbContext) =>
 {
     var jobId = $"job_{Guid.NewGuid():N}";
     var createdAt = DateTimeOffset.UtcNow;
+    var payloadJson = JsonSerializer.Serialize(req);
 
     var job = new JobMessage(
         Id: jobId,
@@ -71,7 +73,8 @@ app.MapPost("/jobs/send-email", async (SendEmailRequest req, IConnectionMultiple
         CreatedAt: createdAt);
 
     var redis = mux.GetDatabase();
-    await redis.ListLeftPushAsync(RedisQueues.DefaultQueue, JsonSerializer.Serialize(job));
+    var queue = RedisQueues.GetQueue(priority);
+    await redis.ListLeftPushAsync(queue, JsonSerializer.Serialize(job));
     await redis.StringSetAsync(RedisKeys.JobStatus(jobId), JobStatus.PENDING.ToString());
     await redis.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 
@@ -81,7 +84,8 @@ app.MapPost("/jobs/send-email", async (SendEmailRequest req, IConnectionMultiple
         Type = job.Type,
         Status = JobStatus.PENDING.ToString(),
         CreatedAt = createdAt,
-        RetryCount = 0
+        RetryCount = 0,
+        PayloadJson = payloadJson
     });
     await dbContext.SaveChangesAsync();
 
@@ -90,10 +94,11 @@ app.MapPost("/jobs/send-email", async (SendEmailRequest req, IConnectionMultiple
 .WithName("EnqueueSendEmail")
 .WithOpenApi();
 
-app.MapPost("/jobs/image-processing", async (ImageProcessingRequest req, IConnectionMultiplexer mux, JobDbContext dbContext) =>
+app.MapPost("/jobs/image-processing", async (ImageProcessingRequest req, string? priority, IConnectionMultiplexer mux, JobDbContext dbContext) =>
 {
     var jobId = $"job_{Guid.NewGuid():N}";
     var createdAt = DateTimeOffset.UtcNow;
+    var payloadJson = JsonSerializer.Serialize(req);
 
     var job = new JobMessage(
         Id: jobId,
@@ -104,7 +109,8 @@ app.MapPost("/jobs/image-processing", async (ImageProcessingRequest req, IConnec
         CreatedAt: createdAt);
 
     var redis = mux.GetDatabase();
-    await redis.ListLeftPushAsync(RedisQueues.DefaultQueue, JsonSerializer.Serialize(job));
+    var queue = RedisQueues.GetQueue(priority);
+    await redis.ListLeftPushAsync(queue, JsonSerializer.Serialize(job));
     await redis.StringSetAsync(RedisKeys.JobStatus(jobId), JobStatus.PENDING.ToString());
     await redis.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
 
@@ -114,7 +120,8 @@ app.MapPost("/jobs/image-processing", async (ImageProcessingRequest req, IConnec
         Type = job.Type,
         Status = JobStatus.PENDING.ToString(),
         CreatedAt = createdAt,
-        RetryCount = 0
+        RetryCount = 0,
+        PayloadJson = payloadJson
     });
     await dbContext.SaveChangesAsync();
 
@@ -153,11 +160,89 @@ app.MapGet("/jobs", async (int page, int pageSize, JobDbContext dbContext) =>
 .WithName("ListJobs")
 .WithOpenApi();
 
+app.MapPost("/jobs/{jobId}/retry", async (string jobId, IConnectionMultiplexer mux, JobDbContext dbContext) =>
+{
+    var job = await dbContext.Jobs.FindAsync(jobId);
+    if (job is null)
+        return Results.NotFound(new { id = jobId });
+    if (job.Status != "FAILED")
+        return Results.BadRequest(new { error = "Only FAILED jobs can be retried.", status = job.Status });
+
+    if (string.IsNullOrEmpty(job.PayloadJson))
+        return Results.BadRequest(new { error = "Job has no stored payload for retry." });
+
+    using var payloadDoc = JsonDocument.Parse(job.PayloadJson);
+    var payloadElement = payloadDoc.RootElement.Clone();
+
+    var jobMessage = new JobMessage(
+        Id: job.Id,
+        Type: job.Type,
+        Payload: payloadElement,
+        Retry: 0,
+        MaxRetry: 5,
+        CreatedAt: DateTimeOffset.UtcNow);
+
+    var redis = mux.GetDatabase();
+    await redis.ListLeftPushAsync(RedisQueues.DefaultQueue, JsonSerializer.Serialize(jobMessage));
+    await redis.StringSetAsync(RedisKeys.JobStatus(jobId), JobStatus.PENDING.ToString());
+    await redis.StringSetAsync(RedisKeys.JobUpdatedAt(jobId), DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+
+    job.Status = JobStatus.PENDING.ToString();
+    job.RetryCount = 0;
+    job.Result = null;
+    job.ErrorMessage = null;
+    job.StartedAt = null;
+    job.FinishedAt = null;
+    await dbContext.SaveChangesAsync();
+
+    return Results.Accepted($"/jobs/{jobId}", new { id = jobId });
+})
+.WithName("RetryJob")
+.WithOpenApi();
+
+app.MapGet("/jobs/queue-stats", async (IConnectionMultiplexer mux) =>
+{
+    var db = mux.GetDatabase();
+    var endpoints = mux.GetEndPoints();
+    var server = endpoints.Length > 0 ? mux.GetServer(endpoints[0]) : null;
+
+    var highLen = await db.ListLengthAsync(RedisQueues.HighQueue);
+    var defaultLen = await db.ListLengthAsync(RedisQueues.DefaultQueue);
+    var lowLen = await db.ListLengthAsync(RedisQueues.LowQueue);
+    var deadLetterLen = await db.ListLengthAsync(RedisQueues.DeadLetterQueue);
+
+    var activeWorkers = 0;
+    if (server != null)
+    {
+        var workerKeys = server.Keys(pattern: "worker_heartbeat:*");
+        activeWorkers = workerKeys.Count();
+    }
+
+    return Results.Ok(new
+    {
+        queueHigh = highLen,
+        queueDefault = defaultLen,
+        queueLow = lowLen,
+        deadLetter = deadLetterLen,
+        activeWorkers
+    });
+})
+.WithName("QueueStats")
+.WithOpenApi();
+
 app.Run();
 
 static class RedisQueues
 {
+    public const string HighQueue = "job_queue:high";
     public const string DefaultQueue = "job_queue:default";
+    public const string LowQueue = "job_queue:low";
+    public const string DeadLetterQueue = "job_queue:dead_letter";
+
+    public static string GetQueue(string? priority) =>
+        string.Equals(priority, "high", StringComparison.OrdinalIgnoreCase) ? HighQueue
+        : string.Equals(priority, "low", StringComparison.OrdinalIgnoreCase) ? LowQueue
+        : DefaultQueue;
 }
 
 static class RedisKeys

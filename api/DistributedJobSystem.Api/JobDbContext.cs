@@ -25,6 +25,7 @@ public class JobDbContext : DbContext
             entity.Property(j => j.RetryCount).HasColumnName("retry_count");
             entity.Property(j => j.Result).HasColumnName("result");
             entity.Property(j => j.ErrorMessage).HasColumnName("error_message");
+            entity.Property(j => j.PayloadJson).HasColumnName("payload_json");
         });
     }
 }
@@ -40,4 +41,5 @@ public class Job
     public int RetryCount { get; set; }
     public string? Result { get; set; }
     public string? ErrorMessage { get; set; }
+    public string? PayloadJson { get; set; }
 }

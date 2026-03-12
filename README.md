@@ -22,8 +22,10 @@ This starts:
 
 In Git Bash / Linux (using `\` for line continuation):
 
+Add `?priority=high` or `?priority=low` to use priority queues (default is normal).
+
 ```bash
-curl -X POST http://localhost:8080/jobs/send-email \
+curl -X POST "http://localhost:8080/jobs/send-email?priority=high" \
   -H "Content-Type: application/json" \
   -d "{\"to\":\"user@email.com\",\"subject\":\"Welcome\",\"body\":\"Hello\"}"
 ```
@@ -33,6 +35,8 @@ curl -X POST http://localhost:8080/jobs/image-processing \
   -H "Content-Type: application/json" \
   -d "{\"imageUrl\":\"https://example.com/image.jpg\",\"targetWidth\":256,\"targetHeight\":256}"
 ```
+
+Workers process **high** before **default** before **low**. The dashboard shows queue sizes and active worker count.
 
 The API responds with:
 
@@ -56,6 +60,18 @@ To list recent jobs (paged):
 curl "http://localhost:8080/jobs?page=1&pageSize=50"
 ```
 
+Queue and worker stats:
+
+```bash
+curl http://localhost:8080/jobs/queue-stats
+```
+
+Retry a failed job (re-queues with stored payload):
+
+```bash
+curl -X POST http://localhost:8080/jobs/{jobId}/retry
+```
+
 ### Via dashboard
 
 Open:
@@ -68,5 +84,7 @@ The dashboard shows:
 - Retry count
 - Created / started / finished timestamps
 - Result or error message
+- **Queue stats**: high / default / low queue length, dead-letter count, active workers
+- **Retry** button for failed jobs (re-queues the job)
 
 It auto‑refreshes every few seconds and can also be refreshed manually with the **Refresh** button.

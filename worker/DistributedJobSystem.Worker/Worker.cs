@@ -9,6 +9,7 @@ public class Worker : BackgroundService
     private readonly ILogger<Worker> _logger;
     private readonly IConnectionMultiplexer _mux;
     private readonly string _pgConnectionString;
+    private readonly string _workerId;
 
     public Worker(ILogger<Worker> logger, IConnectionMultiplexer mux, IConfiguration configuration)
     {
@@ -17,25 +18,31 @@ public class Worker : BackgroundService
         _pgConnectionString =
             configuration.GetSection("Postgres")["ConnectionString"]
             ?? "Host=postgres;Port=5432;Database=djs;Username=djs;Password=djs";
+        _workerId = $"{Environment.MachineName}_{Environment.ProcessId}_{Guid.NewGuid():N}".Substring(0, 48);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         var db = _mux.GetDatabase();
-        _logger.LogInformation("Worker started.");
+        _logger.LogInformation("Worker started. Id={WorkerId}", _workerId);
 
         while (!stoppingToken.IsCancellationRequested)
         {
+            await SendHeartbeatAsync(db, stoppingToken);
+
             RedisValue jobJson;
             try
             {
-                var popped = await db.ListRightPopAsync(RedisQueues.DefaultQueue);
+                var popped = await db.ListRightPopAsync(RedisQueues.HighQueue);
+                if (popped.IsNullOrEmpty)
+                    popped = await db.ListRightPopAsync(RedisQueues.DefaultQueue);
+                if (popped.IsNullOrEmpty)
+                    popped = await db.ListRightPopAsync(RedisQueues.LowQueue);
                 if (popped.IsNullOrEmpty)
                 {
                     await Task.Delay(250, stoppingToken);
                     continue;
                 }
-
                 jobJson = popped;
             }
             catch (Exception ex)
@@ -147,6 +154,18 @@ public class Worker : BackgroundService
         }
     }
 
+    private async Task SendHeartbeatAsync(IDatabase db, CancellationToken ct)
+    {
+        try
+        {
+            await db.StringSetAsync(RedisKeys.WorkerHeartbeat(_workerId), DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString(), TimeSpan.FromSeconds(15));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Heartbeat failed");
+        }
+    }
+
     private static async Task SetStatusAsync(IDatabase db, string jobId, JobStatus status, CancellationToken ct)
     {
         await db.StringSetAsync(RedisKeys.JobStatus(jobId), status.ToString());
@@ -199,7 +218,9 @@ public class Worker : BackgroundService
 
 static class RedisQueues
 {
+    public const string HighQueue = "job_queue:high";
     public const string DefaultQueue = "job_queue:default";
+    public const string LowQueue = "job_queue:low";
     public const string DeadLetterQueue = "job_queue:dead_letter";
 }
 
@@ -209,6 +230,7 @@ static class RedisKeys
     public static string JobUpdatedAt(string jobId) => $"job_updated_at:{jobId}";
     public static string JobResult(string jobId) => $"job_result:{jobId}";
     public static string JobError(string jobId) => $"job_error:{jobId}";
+    public static string WorkerHeartbeat(string workerId) => $"worker_heartbeat:{workerId}";
 }
 
 enum JobStatus
